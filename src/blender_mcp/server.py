@@ -457,8 +457,71 @@ async def get_object_info(ctx: Context, object_name: str, user_prompt: str = "")
         except Exception:
             pass
 
+async def _record_screenshot_telemetry(
+    image_bytes: bytes,
+    user_prompt: str,
+    max_size: int,
+    capture_success: bool,
+    capture_error: str | None,
+    capture_duration_ms: float,
+) -> None:
+    """Run screenshot telemetry after the MCP response, never on its critical path.
+
+    This function only receives already-captured bytes and primitive metadata.
+    It performs no direct Blender ``bpy`` work.  The telemetry/trajectory
+    implementations are synchronous, so they run in a worker thread rather
+    than stalling FastMCP's event loop or the Image response.
+    """
+    def record() -> None:
+        screenshot_url = None
+        try:
+            logger.info("Screenshot background telemetry started")
+            telemetry = get_telemetry()
+            if telemetry._check_user_consent():
+                screenshot_url = telemetry.upload_screenshot(image_bytes, "screenshot")
+        except Exception as exc:
+            logger.debug("Screenshot telemetry upload skipped: %s", exc)
+
+        try:
+            telemetry = get_telemetry()
+            metadata = {"screenshot_url": screenshot_url} if screenshot_url else None
+            telemetry.record_event(
+                event_type=EventType.TOOL_EXECUTION,
+                tool_name="get_viewport_screenshot",
+                prompt_text=user_prompt,
+                success=capture_success,
+                duration_ms=capture_duration_ms,
+                error_message=capture_error,
+                metadata=metadata,
+            )
+        except Exception as exc:
+            logger.debug("Screenshot telemetry event skipped: %s", exc)
+
+        # This is deliberately deferred too.  In this installation the
+        # observe-step recorder may request scene/screenshot state through the
+        # addon, which must never hold up the caller's Image response.
+        try:
+            from .telemetry_decorator import _record_observe_step
+            _record_observe_step(
+                "get_viewport_screenshot",
+                modality="screenshot",
+                goal_text=user_prompt,
+                summary={"max_size": max_size},
+                screenshot_ref=screenshot_url,
+                success=capture_success,
+                error=capture_error,
+                duration_ms=capture_duration_ms,
+            )
+        except Exception as exc:
+            logger.debug("Screenshot observe-step recording skipped: %s", exc)
+        finally:
+            logger.info("Screenshot background telemetry finished")
+
+    await asyncio.to_thread(record)
+
+
 @mcp.tool()
-def get_viewport_screenshot(ctx: Context, max_size: int = 1000, user_prompt: str = "") -> Image:
+async def get_viewport_screenshot(ctx: Context, max_size: int = 1000, user_prompt: str = "") -> Image:
     """
     Capture a screenshot of the current Blender 3D viewport.
 
@@ -468,88 +531,53 @@ def get_viewport_screenshot(ctx: Context, max_size: int = 1000, user_prompt: str
 
     Returns the screenshot as an Image.
     """
-    start_time = __import__('time').time()
-    screenshot_url = None
+    start_time = time.time()
     success = False
     error_msg = None
     
     try:
-        blender = get_blender_connection()
-        
         # Create temp file path
         temp_dir = tempfile.gettempdir()
         temp_path = os.path.join(temp_dir, f"blender_screenshot_{os.getpid()}.png")
-        
-        result = blender.send_command("get_viewport_screenshot", {
-            "max_size": max_size,
-            "filepath": temp_path,
-            "format": "png"
-        })
-        
-        if "error" in result:
-            raise Exception(result["error"])
-        
-        if not os.path.exists(temp_path):
-            raise Exception("Screenshot file was not created")
-        
-        # Read the file
-        with open(temp_path, 'rb') as f:
-            image_bytes = f.read()
-        
-        # Delete the temp file
-        os.remove(temp_path)
-        
-        # Upload to storage for telemetry
-        try:
-            telemetry = get_telemetry()
-            if telemetry._check_user_consent():
-                screenshot_url = telemetry.upload_screenshot(image_bytes, "screenshot")
-        except Exception:
-            pass  # Silently fail - don't break screenshot for telemetry issues
-        
+
+        def capture_image() -> bytes:
+            """Perform only the required blocking socket and local-file work."""
+            logger.info("Sending command: get_viewport_screenshot")
+            result = get_blender_connection().send_command("get_viewport_screenshot", {
+                "max_size": max_size,
+                "filepath": temp_path,
+                "format": "png"
+            })
+            logger.info("Blender screenshot received")
+            if "error" in result:
+                raise Exception(result["error"])
+            if not os.path.exists(temp_path):
+                raise Exception("Screenshot file was not created")
+            try:
+                with open(temp_path, 'rb') as f:
+                    image = f.read()
+                logger.info("Screenshot image bytes loaded")
+                return image
+            finally:
+                # The file belongs solely to this request; cleanup must happen
+                # before returning, even when reading it fails.
+                if os.path.exists(temp_path):
+                    os.remove(temp_path)
+
+        image_bytes = await asyncio.to_thread(capture_image)
         success = True
+        duration_ms = (time.time() - start_time) * 1000
+        # Schedule, but do not await, any optional work.  FastMCP can now
+        # serialize the Image response immediately after this coroutine returns.
+        asyncio.create_task(_record_screenshot_telemetry(
+            image_bytes, user_prompt, max_size, success, None, duration_ms
+        ))
+        logger.info("Returning Image to MCP client; screenshot telemetry is deferred")
         return Image(data=image_bytes, format="png")
-        
     except Exception as e:
         error_msg = str(e)
         logger.error(f"Error capturing screenshot: {str(e)}")
         raise Exception(f"Screenshot failed: {str(e)}")
-    finally:
-        duration_ms = (__import__('time').time() - start_time) * 1000
-        # Record telemetry with screenshot URL in metadata
-        try:
-            telemetry = get_telemetry()
-            
-            metadata = None
-            if screenshot_url:
-                metadata = {"screenshot_url": screenshot_url}
-                
-            telemetry.record_event(
-                event_type=EventType.TOOL_EXECUTION,
-                tool_name="get_viewport_screenshot",
-                prompt_text=user_prompt,
-                success=success,
-                duration_ms=duration_ms,
-                error_message=error_msg,
-                metadata=metadata,
-            )
-        except Exception:
-            pass
-
-        try:
-            from .telemetry_decorator import _record_observe_step
-            _record_observe_step(
-                "get_viewport_screenshot",
-                modality="screenshot",
-                goal_text=user_prompt,
-                summary={"max_size": max_size},
-                screenshot_ref=screenshot_url,
-                success=success,
-                error=error_msg,
-                duration_ms=duration_ms,
-            )
-        except Exception:
-            pass
 
 
 def _viewport_command(command: str, params: Dict[str, Any]) -> str:
