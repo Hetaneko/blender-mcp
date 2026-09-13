@@ -204,6 +204,15 @@ async def server_lifespan(server: FastMCP) -> AsyncIterator[Dict[str, Any]]:
     try:
         # Just log that we're starting up
         logger.info("BlenderMCP server starting up")
+        registered_tools = _registered_mcp_tool_names()
+        if registered_tools:
+            logger.info(
+                "FastMCP registered %d tools: %s",
+                len(registered_tools),
+                ", ".join(registered_tools),
+            )
+        else:
+            logger.warning("FastMCP tool registry could not be inspected at startup")
 
         try:
             status = check_addon_status_on_startup()
@@ -303,6 +312,23 @@ def get_blender_connection():
         _maybe_handshake_addon(_blender_connection)
 
     return _blender_connection
+
+
+def _registered_mcp_tool_names() -> List[str]:
+    """Return FastMCP's registered tool names for startup diagnostics.
+
+    FastMCP 1.x keeps the registration map in its tool manager.  Keep this
+    best-effort and private-API tolerant: diagnostics must never prevent the
+    server from starting if FastMCP changes an implementation detail.
+    """
+    try:
+        manager = getattr(mcp, "_tool_manager", None)
+        tools = getattr(manager, "_tools", None)
+        if isinstance(tools, dict):
+            return sorted(tools)
+    except Exception as exc:
+        logger.debug("Could not inspect FastMCP tool registry: %s", exc)
+    return []
 
 
 @mcp.tool()
