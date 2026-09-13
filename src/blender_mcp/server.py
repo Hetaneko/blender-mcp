@@ -552,6 +552,125 @@ def get_viewport_screenshot(ctx: Context, max_size: int = 1000, user_prompt: str
             pass
 
 
+def _viewport_command(command: str, params: Dict[str, Any]) -> str:
+    """Send one atomic viewport command and serialize Blender's structured reply."""
+    try:
+        result = get_blender_connection().send_command(command, params)
+        return json.dumps(result, indent=2)
+    except Exception as exc:
+        logger.error("Viewport command %s failed: %s", command, exc)
+        return json.dumps({"success": False, "error": str(exc)})
+
+
+def _screen_params(x: float, y: float, image_width: int, image_height: int) -> Dict[str, Any]:
+    """Validate the screenshot coordinate contract shared by screen-space tools."""
+    if image_width <= 0 or image_height <= 0:
+        raise ValueError("image_width and image_height must be positive")
+    if not 0 <= x <= image_width or not 0 <= y <= image_height:
+        raise ValueError("x and y must be inside the supplied screenshot")
+    return {"x": float(x), "y": float(y), "image_width": int(image_width), "image_height": int(image_height)}
+
+
+@mcp.tool()
+def raycast_from_screen(ctx: Context, x: float, y: float, image_width: int, image_height: int) -> str:
+    """Raycast a top-left-origin screenshot pixel and return its 3D surface hit."""
+    return _viewport_command("raycast_from_screen", _screen_params(x, y, image_width, image_height))
+
+
+@mcp.tool()
+def create_empty_at_screen(ctx: Context, x: float, y: float, image_width: int, image_height: int, name: str = "ScreenAnchor", empty_type: str = "PLAIN_AXES", size: float = 0.2, orient_to_normal: bool = False) -> str:
+    """Create an Empty on geometry under a top-left-origin screenshot pixel."""
+    params = _screen_params(x, y, image_width, image_height)
+    params.update({"name": name, "empty_type": empty_type, "size": size, "orient_to_normal": orient_to_normal})
+    return _viewport_command("create_empty_at_screen", params)
+
+
+@mcp.tool()
+def look_at_screen_point(ctx: Context, x: float, y: float, image_width: int, image_height: int, distance: float = None) -> str:
+    """Focus the viewport on geometry under a top-left-origin screenshot pixel."""
+    params = _screen_params(x, y, image_width, image_height)
+    if distance is not None:
+        params["distance"] = distance
+    return _viewport_command("look_at_screen_point", params)
+
+
+@mcp.tool()
+def orbit_around_screen_point(ctx: Context, x: float, y: float, image_width: int, image_height: int, yaw: float = 0.0, pitch: float = 0.0) -> str:
+    """Raycast a screenshot pixel and orbit once around its temporary 3D pivot; positive pitch looks from above."""
+    params = _screen_params(x, y, image_width, image_height)
+    params.update({"yaw": yaw, "pitch": pitch})
+    return _viewport_command("orbit_around_screen_point", params)
+
+
+@mcp.tool()
+def orbit_view(ctx: Context, yaw: float = 0.0, pitch: float = 0.0) -> str:
+    """Orbit once around the current viewport pivot; positive pitch views from above."""
+    return _viewport_command("orbit_view", {"yaw": yaw, "pitch": pitch})
+
+
+@mcp.tool()
+def zoom_view(ctx: Context, factor: float) -> str:
+    """Zoom once: factors below one zoom in and factors above one zoom out."""
+    return _viewport_command("zoom_view", {"factor": factor})
+
+
+@mcp.tool()
+def pan_view(ctx: Context, x: float = 0.0, y: float = 0.0) -> str:
+    """Pan once in normalized view directions: positive x is right and positive y is up."""
+    return _viewport_command("pan_view", {"x": x, "y": y})
+
+
+@mcp.tool()
+def frame_object(ctx: Context, object_name: str, distance_multiplier: float = 2.0) -> str:
+    """Frame one named Blender object in the active viewport."""
+    return _viewport_command("frame_object", {"object_name": object_name, "distance_multiplier": distance_multiplier})
+
+
+@mcp.tool()
+def frame_all(ctx: Context, distance_multiplier: float = 2.0) -> str:
+    """Frame all visible non-camera, non-light scene objects once."""
+    return _viewport_command("frame_all", {"distance_multiplier": distance_multiplier})
+
+
+@mcp.tool()
+def frame_point(ctx: Context, location: List[float], distance: float = 2.0) -> str:
+    """Frame one explicit [x, y, z] world-space point."""
+    return _viewport_command("frame_point", {"location": location, "distance": distance})
+
+
+@mcp.tool()
+def create_empty(ctx: Context, name: str, location: List[float], empty_type: str = "PLAIN_AXES", size: float = 0.2, rotation: List[float] = None) -> str:
+    """Create a named Empty at an explicit world-space location and optional Euler rotation in radians."""
+    params = {"name": name, "location": location, "empty_type": empty_type, "size": size}
+    if rotation is not None:
+        params["rotation"] = rotation
+    return _viewport_command("create_empty", params)
+
+
+@mcp.tool()
+def move_empty(ctx: Context, name: str, location: List[float]) -> str:
+    """Move one existing Empty to an explicit [x, y, z] world-space location."""
+    return _viewport_command("move_empty", {"name": name, "location": location})
+
+
+@mcp.tool()
+def rotate_empty(ctx: Context, name: str, rotation: List[float]) -> str:
+    """Set one existing Empty's Euler rotation [x, y, z] in radians."""
+    return _viewport_command("rotate_empty", {"name": name, "rotation": rotation})
+
+
+@mcp.tool()
+def delete_empty(ctx: Context, name: str) -> str:
+    """Delete one named Empty."""
+    return _viewport_command("delete_empty", {"name": name})
+
+
+@mcp.tool()
+def rename_empty(ctx: Context, old_name: str, new_name: str) -> str:
+    """Rename one Empty without changing its transform."""
+    return _viewport_command("rename_empty", {"old_name": old_name, "new_name": new_name})
+
+
 @mcp.tool()
 @trajectory_tool("execute_blender_code", capture_code=True)
 async def execute_blender_code(ctx: Context, code: str, user_prompt: str = "") -> str:
