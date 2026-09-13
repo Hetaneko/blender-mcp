@@ -627,13 +627,29 @@ def _screen_params(x: float, y: float, image_width: int, image_height: int) -> D
 
 @mcp.tool()
 def raycast_from_screen(ctx: Context, x: float, y: float, image_width: int, image_height: int) -> str:
-    """Raycast a top-left-origin screenshot pixel and return its 3D surface hit."""
+    """Raycast a top-left-origin screenshot pixel and return its 3D surface hit.
+
+    Prefer this to execute_blender_code whenever a screenshot pixel must be
+    converted to a world-space point. Do not recreate this with
+    bpy_extras.view3d_utils or scene.ray_cast in Python: the addon performs
+    the coordinate conversion and raycast. Use one atomic call, then observe
+    again with get_viewport_screenshot when useful.
+    """
     return _viewport_command("raycast_from_screen", _screen_params(x, y, image_width, image_height))
 
 
 @mcp.tool()
 def create_empty_at_screen(ctx: Context, x: float, y: float, image_width: int, image_height: int, name: str = "ScreenAnchor", empty_type: str = "PLAIN_AXES", size: float = 0.2, orient_to_normal: bool = False) -> str:
-    """Create an Empty on geometry under a top-left-origin screenshot pixel."""
+    """Create a persistent Empty on geometry under a top-left-origin screenshot pixel.
+
+    This is the preferred tool for anchors on visually identifiable features
+    such as seats, hands, wheels, or visible corners. Workflow: take a
+    screenshot, identify its pixel, call this tool, then observe again if
+    verification is useful. Do NOT use execute_blender_code with
+    bpy_extras.view3d_utils or scene.ray_cast to reproduce this operation;
+    the addon performs the screen-to-ray conversion and creates the Empty at
+    the actual 3D hit point.
+    """
     params = _screen_params(x, y, image_width, image_height)
     params.update({"name": name, "empty_type": empty_type, "size": size, "orient_to_normal": orient_to_normal})
     return _viewport_command("create_empty_at_screen", params)
@@ -641,7 +657,12 @@ def create_empty_at_screen(ctx: Context, x: float, y: float, image_width: int, i
 
 @mcp.tool()
 def look_at_screen_point(ctx: Context, x: float, y: float, image_width: int, image_height: int, distance: float = None) -> str:
-    """Focus the viewport on geometry under a top-left-origin screenshot pixel."""
+    """Focus the viewport on geometry under a top-left-origin screenshot pixel.
+
+    Prefer this dedicated atomic viewport action over manually raycasting or
+    assigning RegionView3D values in execute_blender_code. Observe the next
+    viewport state before making another visual action.
+    """
     params = _screen_params(x, y, image_width, image_height)
     if distance is not None:
         params["distance"] = distance
@@ -650,7 +671,14 @@ def look_at_screen_point(ctx: Context, x: float, y: float, image_width: int, ima
 
 @mcp.tool()
 def orbit_around_screen_point(ctx: Context, x: float, y: float, image_width: int, image_height: int, yaw: float = 0.0, pitch: float = 0.0) -> str:
-    """Raycast a screenshot pixel and orbit once around its temporary 3D pivot; positive pitch looks from above."""
+    """Orbit once around a target visible at a screenshot pixel; positive pitch views from above.
+
+    Use this when orbiting around something seen in the viewport. It handles
+    the raycast, temporary pivot, and viewport rotation internally. Do not
+    manually raycast, create a pivot Empty, or manipulate RegionView3D via
+    execute_blender_code for this operation. Make one orbit, return, then
+    inspect a fresh screenshot before further navigation.
+    """
     params = _screen_params(x, y, image_width, image_height)
     params.update({"yaw": yaw, "pitch": pitch})
     return _viewport_command("orbit_around_screen_point", params)
@@ -658,43 +686,74 @@ def orbit_around_screen_point(ctx: Context, x: float, y: float, image_width: int
 
 @mcp.tool()
 def orbit_view(ctx: Context, yaw: float = 0.0, pitch: float = 0.0) -> str:
-    """Orbit once around the current viewport pivot; positive pitch views from above."""
+    """Orbit once around the current viewport pivot; positive pitch views from above.
+
+    Always prefer this over execute_blender_code for viewport orbiting or
+    RegionView3D rotation. This is one atomic action; observe before chaining
+    another visual adjustment.
+    """
     return _viewport_command("orbit_view", {"yaw": yaw, "pitch": pitch})
 
 
 @mcp.tool()
 def zoom_view(ctx: Context, factor: float) -> str:
-    """Zoom once: factors below one zoom in and factors above one zoom out."""
+    """Zoom once: factors below one zoom in and factors above one zoom out.
+
+    Use this dedicated tool rather than setting view_distance through
+    execute_blender_code. Return and observe after the atomic zoom.
+    """
     return _viewport_command("zoom_view", {"factor": factor})
 
 
 @mcp.tool()
 def pan_view(ctx: Context, x: float = 0.0, y: float = 0.0) -> str:
-    """Pan once in normalized view directions: positive x is right and positive y is up."""
+    """Pan once in normalized view directions: positive x is right and positive y is up.
+
+    Use this dedicated tool rather than changing view_location through
+    execute_blender_code. Return and observe after the atomic pan.
+    """
     return _viewport_command("pan_view", {"x": x, "y": y})
 
 
 @mcp.tool()
 def frame_object(ctx: Context, object_name: str, distance_multiplier: float = 2.0) -> str:
-    """Frame one named Blender object in the active viewport."""
+    """Frame one named Blender object in the active viewport.
+
+    Prefer this for "frame this object" rather than viewport Python or
+    RegionView3D manipulation in execute_blender_code.
+    """
     return _viewport_command("frame_object", {"object_name": object_name, "distance_multiplier": distance_multiplier})
 
 
 @mcp.tool()
 def frame_all(ctx: Context, distance_multiplier: float = 2.0) -> str:
-    """Frame all visible non-camera, non-light scene objects once."""
+    """Frame all visible non-camera, non-light scene objects once.
+
+    Prefer this for centering or framing the scene rather than viewport
+    scripting in execute_blender_code.
+    """
     return _viewport_command("frame_all", {"distance_multiplier": distance_multiplier})
 
 
 @mcp.tool()
 def frame_point(ctx: Context, location: List[float], distance: float = 2.0) -> str:
-    """Frame one explicit [x, y, z] world-space point."""
+    """Frame one explicit [x, y, z] world-space point.
+
+    Prefer this for framing or looking at a known 3D point instead of setting
+    viewport state manually through execute_blender_code.
+    """
     return _viewport_command("frame_point", {"location": location, "distance": distance})
 
 
 @mcp.tool()
 def create_empty(ctx: Context, name: str, location: List[float], empty_type: str = "PLAIN_AXES", size: float = 0.2, rotation: List[float] = None) -> str:
-    """Create a named Empty at an explicit world-space location and optional Euler rotation in radians."""
+    """Create a named persistent Empty at a known world-space location.
+
+    Prefer create_empty_at_screen when the requested anchor is visually
+    identifiable in a screenshot; use this tool when its 3D coordinate is
+    already known. Do not recreate either Empty operation with Python when a
+    dedicated Empty tool fits.
+    """
     params = {"name": name, "location": location, "empty_type": empty_type, "size": size}
     if rotation is not None:
         params["rotation"] = rotation
@@ -703,25 +762,31 @@ def create_empty(ctx: Context, name: str, location: List[float], empty_type: str
 
 @mcp.tool()
 def move_empty(ctx: Context, name: str, location: List[float]) -> str:
-    """Move one existing Empty to an explicit [x, y, z] world-space location."""
+    """Move one existing Empty to an explicit [x, y, z] world-space location.
+
+    Prefer this dedicated Empty-management tool over execute_blender_code.
+    """
     return _viewport_command("move_empty", {"name": name, "location": location})
 
 
 @mcp.tool()
 def rotate_empty(ctx: Context, name: str, rotation: List[float]) -> str:
-    """Set one existing Empty's Euler rotation [x, y, z] in radians."""
+    """Set one existing Empty's Euler rotation [x, y, z] in radians.
+
+    Prefer this dedicated Empty-management tool over execute_blender_code.
+    """
     return _viewport_command("rotate_empty", {"name": name, "rotation": rotation})
 
 
 @mcp.tool()
 def delete_empty(ctx: Context, name: str) -> str:
-    """Delete one named Empty."""
+    """Delete one named Empty. Prefer this dedicated Empty-management tool over execute_blender_code."""
     return _viewport_command("delete_empty", {"name": name})
 
 
 @mcp.tool()
 def rename_empty(ctx: Context, old_name: str, new_name: str) -> str:
-    """Rename one Empty without changing its transform."""
+    """Rename one Empty without changing its transform. Prefer this dedicated Empty-management tool over execute_blender_code."""
     return _viewport_command("rename_empty", {"old_name": old_name, "new_name": new_name})
 
 
@@ -729,7 +794,17 @@ def rename_empty(ctx: Context, old_name: str, new_name: str) -> str:
 @trajectory_tool("execute_blender_code", capture_code=True)
 async def execute_blender_code(ctx: Context, code: str, user_prompt: str = "") -> str:
     """
-    Execute arbitrary Python code in Blender. Make sure to do it step-by-step by breaking it into smaller chunks.
+    Execute arbitrary Python code in Blender as a fallback when no dedicated MCP tool provides the required operation.
+
+    ALWAYS prefer a dedicated MCP tool when one exists. Do not recreate an
+    existing MCP operation with Python. In particular, use the dedicated tools
+    for viewport navigation, framing, screen-space raycasting, screen-point
+    orbiting, and Empty creation/management; do not manipulate
+    region_3d.view_location, region_3d.view_rotation, region_3d.view_distance,
+    viewport perspective, or bpy_extras.view3d_utils raycasts here. For visual
+    work, use the loop: screenshot -> one atomic dedicated action -> screenshot
+    -> evaluate. This fallback remains appropriate for arbitrary Blender work
+    that has no dedicated MCP tool.
 
     Parameters:
     - code: The Python code to execute
@@ -1840,6 +1915,31 @@ def record_trajectory_feedback(
     except Exception as e:
         logger.debug(f"record_trajectory_feedback failed: {e}")
         return f"Trajectory feedback skipped: {e}"
+
+
+@mcp.prompt()
+def viewport_tool_selection() -> str:
+    """Preference hierarchy for Blender viewport, screen, and Empty actions."""
+    return """Always prefer a dedicated MCP tool when one exists; use
+execute_blender_code only when no dedicated tool provides the needed operation.
+
+For visual work, use this loop: get_viewport_screenshot -> visually reason ->
+one atomic dedicated action -> get_viewport_screenshot -> evaluate. Do not
+chain viewport operations through Python or assume a visual result without
+observing it.
+
+Use create_empty_at_screen for a persistent anchor on a visible feature. It
+performs the screenshot-to-ray conversion and scene raycast itself. Use
+raycast_from_screen when only the 3D hit is needed, and
+orbit_around_screen_point to orbit around a visible target. Do not reproduce
+these with bpy_extras.view3d_utils, scene.ray_cast, temporary Empty creation,
+or RegionView3D assignments in execute_blender_code.
+
+Use orbit_view, zoom_view, pan_view, frame_object, frame_all, and frame_point
+for viewport navigation and framing. Use create_empty, move_empty,
+rotate_empty, delete_empty, and rename_empty for persistent Empty management.
+execute_blender_code remains available for Blender functionality outside these
+dedicated capabilities."""
 
 
 @mcp.prompt()
