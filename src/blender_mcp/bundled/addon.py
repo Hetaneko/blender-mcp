@@ -2,6 +2,7 @@
 
 import re
 import bpy
+import math
 import mathutils
 import json
 import threading
@@ -766,6 +767,21 @@ class BlenderMCPServer:
             "get_addon_info": self.get_addon_info,
             "get_object_info": self.get_object_info,
             "get_viewport_screenshot": self.get_viewport_screenshot,
+            "raycast_from_screen": self.raycast_from_screen,
+            "create_empty_at_screen": self.create_empty_at_screen,
+            "look_at_screen_point": self.look_at_screen_point,
+            "orbit_around_screen_point": self.orbit_around_screen_point,
+            "orbit_view": self.orbit_view,
+            "zoom_view": self.zoom_view,
+            "pan_view": self.pan_view,
+            "frame_object": self.frame_object,
+            "frame_all": self.frame_all,
+            "frame_point": self.frame_point,
+            "create_empty": self.create_empty,
+            "move_empty": self.move_empty,
+            "rotate_empty": self.rotate_empty,
+            "delete_empty": self.delete_empty,
+            "rename_empty": self.rename_empty,
             "execute_code": self.execute_code,
             "drain_human_activity": self.drain_human_activity,
             "get_telemetry_consent": self.get_telemetry_consent,
@@ -850,6 +866,21 @@ class BlenderMCPServer:
                 "get_addon_info",
                 "get_object_info",
                 "get_viewport_screenshot",
+                "raycast_from_screen",
+                "create_empty_at_screen",
+                "look_at_screen_point",
+                "orbit_around_screen_point",
+                "orbit_view",
+                "zoom_view",
+                "pan_view",
+                "frame_object",
+                "frame_all",
+                "frame_point",
+                "create_empty",
+                "move_empty",
+                "rotate_empty",
+                "delete_empty",
+                "rename_empty",
                 "execute_code",
                 "drain_human_activity",
                 "get_telemetry_consent",
@@ -1363,6 +1394,252 @@ class BlenderMCPServer:
 
         except Exception as e:
             return {"error": str(e)}
+
+    # Viewport commands below are deliberately atomic.  A command mutates the
+    # RegionView3D and returns immediately; the next MCP request arrives after
+    # Blender has had a chance to redraw its event loop.
+    @staticmethod
+    def _viewport():
+        """Return the active 3D view's area, window region, and space."""
+        for area in bpy.context.screen.areas:
+            if area.type == 'VIEW_3D':
+                region = next((r for r in area.regions if r.type == 'WINDOW'), None)
+                if region:
+                    return area, region, area.spaces.active
+        raise ValueError("No 3D viewport found")
+
+    @staticmethod
+    def _vector(value, label, length=3):
+        """Validate a finite numeric vector received through the socket."""
+        if not isinstance(value, (list, tuple)) or len(value) != length:
+            raise ValueError(f"{label} must be a {length}-element numeric array")
+        try:
+            result = mathutils.Vector([float(v) for v in value])
+        except (TypeError, ValueError):
+            raise ValueError(f"{label} must contain numbers")
+        if not all(math.isfinite(v) for v in result):
+            raise ValueError(f"{label} must contain finite numbers")
+        return result
+
+    def _screen_raycast(self, x, y, image_width, image_height):
+        """Raycast a top-left-origin screenshot pixel into the active viewport."""
+        for label, value in (("x", x), ("y", y), ("image_width", image_width), ("image_height", image_height)):
+            if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
+                raise ValueError(f"{label} must be a finite number")
+        if image_width <= 0 or image_height <= 0:
+            raise ValueError("image_width and image_height must be positive")
+        if not 0 <= x <= image_width or not 0 <= y <= image_height:
+            raise ValueError("screen coordinates must lie inside the supplied image")
+
+        _area, region, space = self._viewport()
+        # AI screenshots start at top left; Blender WINDOW regions start at
+        # bottom left.  This conversion is required even when the screenshot
+        # was downscaled by get_viewport_screenshot.
+        viewport_x = float(x) / float(image_width) * region.width
+        viewport_y = region.height - (float(y) / float(image_height) * region.height)
+        from bpy_extras import view3d_utils
+        r3d = space.region_3d
+        origin = view3d_utils.region_2d_to_origin_3d(region, r3d, (viewport_x, viewport_y))
+        direction = view3d_utils.region_2d_to_vector_3d(region, r3d, (viewport_x, viewport_y))
+        hit, location, normal, face_index, obj, _matrix = bpy.context.scene.ray_cast(
+            bpy.context.evaluated_depsgraph_get(), origin, direction)
+        if not hit:
+            return None
+        return {"location": mathutils.Vector(location), "normal": mathutils.Vector(normal),
+                "face_index": int(face_index), "object": obj,
+                "viewport_x": viewport_x, "viewport_y": viewport_y}
+
+    def raycast_from_screen(self, x, y, image_width, image_height):
+        """Return geometry hit by a top-left-origin screenshot pixel."""
+        hit = self._screen_raycast(x, y, image_width, image_height)
+        if not hit:
+            return {"success": False, "error": "No geometry under screen point"}
+        return {"success": True, "object": hit["object"].name,
+                "location": list(hit["location"]), "normal": list(hit["normal"]),
+                "face_index": hit["face_index"], "viewport_coordinates": [hit["viewport_x"], hit["viewport_y"]]}
+
+    def _look_at_point(self, location, distance=None):
+        """Set the view target while retaining the current camera direction."""
+        _area, _region, space = self._viewport()
+        r3d = space.region_3d
+        target = mathutils.Vector(location)
+        forward = r3d.view_rotation @ mathutils.Vector((0, 0, -1))
+        camera = r3d.view_location - forward * r3d.view_distance
+        direction = target - camera
+        if direction.length < 1e-6:
+            direction = forward
+        else:
+            direction.normalize()
+        if distance is None:
+            distance = r3d.view_distance
+        if not isinstance(distance, (int, float)) or not math.isfinite(distance) or distance <= 0:
+            raise ValueError("distance must be a positive finite number")
+        r3d.view_location = target
+        r3d.view_rotation = direction.to_track_quat('-Z', 'Y')
+        r3d.view_distance = max(0.001, float(distance))
+        return r3d
+
+    def create_empty(self, name, location, empty_type='PLAIN_AXES', size=0.2, rotation=None):
+        """Create one named Empty at a world-space location."""
+        if not isinstance(name, str) or not name.strip():
+            raise ValueError("name must be a non-empty string")
+        if bpy.data.objects.get(name):
+            raise ValueError(f"Object already exists: {name}")
+        location = self._vector(location, "location")
+        if empty_type not in {'PLAIN_AXES', 'ARROWS', 'SINGLE_ARROW', 'CIRCLE', 'CUBE', 'SPHERE', 'CONE', 'IMAGE'}:
+            raise ValueError("Unsupported empty_type")
+        if not isinstance(size, (int, float)) or not math.isfinite(size) or size <= 0:
+            raise ValueError("size must be a positive finite number")
+        empty = bpy.data.objects.new(name.strip(), None)
+        empty.empty_display_type = empty_type
+        empty.empty_display_size = float(size)
+        empty.location = location
+        if rotation is not None:
+            empty.rotation_euler = self._vector(rotation, "rotation")
+        bpy.context.collection.objects.link(empty)
+        return {"success": True, "empty_name": empty.name, "location": list(empty.location)}
+
+    def create_empty_at_screen(self, x, y, image_width, image_height, name='ScreenAnchor', empty_type='PLAIN_AXES', size=0.2, orient_to_normal=False):
+        """Raycast one screenshot pixel and create an Empty at its surface hit."""
+        hit = self._screen_raycast(x, y, image_width, image_height)
+        if not hit:
+            return {"success": False, "error": "No geometry under screen point"}
+        result = self.create_empty(name, hit["location"], empty_type, size)
+        empty = bpy.data.objects[result["empty_name"]]
+        if orient_to_normal:
+            empty.rotation_euler = hit["normal"].to_track_quat('Z', 'Y').to_euler()
+        result.update({"hit_object": hit["object"].name, "normal": list(hit["normal"]), "face_index": hit["face_index"]})
+        return result
+
+    def look_at_screen_point(self, x, y, image_width, image_height, distance=None):
+        """Focus the viewport on the geometry beneath one screenshot pixel."""
+        hit = self._screen_raycast(x, y, image_width, image_height)
+        if not hit:
+            return {"success": False, "error": "No geometry under screen point"}
+        r3d = self._look_at_point(hit["location"], distance)
+        return {"success": True, "target": list(hit["location"]), "object": hit["object"].name, "distance": r3d.view_distance}
+
+    def orbit_view(self, yaw=0.0, pitch=0.0):
+        """Orbit once around the current pivot; positive pitch views from above."""
+        if not all(isinstance(v, (int, float)) and math.isfinite(v) for v in (yaw, pitch)):
+            raise ValueError("yaw and pitch must be finite numbers in degrees")
+        _area, _region, space = self._viewport()
+        r3d = space.region_3d
+        target = mathutils.Vector(r3d.view_location)
+        forward = r3d.view_rotation @ mathutils.Vector((0, 0, -1))
+        offset = -forward * r3d.view_distance
+        offset = mathutils.Quaternion((0, 0, 1), math.radians(float(yaw))) @ offset
+        right = r3d.view_rotation @ mathutils.Vector((1, 0, 0))
+        # Invert pitch so positive means the viewpoint moves above the pivot.
+        offset = mathutils.Quaternion(right, math.radians(-float(pitch))) @ offset
+        direction = -offset.normalized()
+        r3d.view_rotation = direction.to_track_quat('-Z', 'Y')
+        r3d.view_distance = offset.length
+        return {"success": True, "target": list(target), "yaw": float(yaw), "pitch": float(pitch)}
+
+    def orbit_around_screen_point(self, x, y, image_width, image_height, yaw=0.0, pitch=0.0):
+        """Raycast, temporarily anchor the pivot with an Empty, orbit once, then remove it."""
+        hit = self._screen_raycast(x, y, image_width, image_height)
+        if not hit:
+            return {"success": False, "error": "No geometry under screen point"}
+        temp = bpy.data.objects.new("__mcp_orbit_pivot__", None)
+        bpy.context.collection.objects.link(temp)
+        temp.location = hit["location"]
+        try:
+            self._look_at_point(temp.location)
+            result = self.orbit_view(yaw, pitch)
+        finally:
+            bpy.data.objects.remove(temp, do_unlink=True)
+        result.update({"target": list(hit["location"]), "object": hit["object"].name})
+        return result
+
+    def zoom_view(self, factor):
+        """Change viewport distance once; factor below one zooms in."""
+        if not isinstance(factor, (int, float)) or not math.isfinite(factor) or factor <= 0:
+            raise ValueError("factor must be a positive finite number")
+        _area, _region, space = self._viewport()
+        old = space.region_3d.view_distance
+        space.region_3d.view_distance = max(0.001, old * float(factor))
+        return {"success": True, "old_distance": old, "new_distance": space.region_3d.view_distance}
+
+    def pan_view(self, x=0.0, y=0.0):
+        """Pan once in normalized screen directions: +x right, +y up."""
+        if not all(isinstance(v, (int, float)) and math.isfinite(v) for v in (x, y)):
+            raise ValueError("x and y must be finite numbers")
+        _area, _region, space = self._viewport()
+        r3d = space.region_3d
+        movement = (r3d.view_rotation @ mathutils.Vector((1, 0, 0))) * float(x) * r3d.view_distance
+        movement += (r3d.view_rotation @ mathutils.Vector((0, 1, 0))) * float(y) * r3d.view_distance
+        r3d.view_location += movement
+        return {"success": True, "movement": list(movement), "view_location": list(r3d.view_location)}
+
+    def frame_point(self, location, distance=2.0):
+        """Frame one explicit world-space point at a requested distance."""
+        location = self._vector(location, "location")
+        r3d = self._look_at_point(location, distance)
+        return {"success": True, "location": list(location), "distance": r3d.view_distance}
+
+    def _frame_objects(self, objects, distance_multiplier=2.0):
+        points = []
+        for obj in objects:
+            if getattr(obj, 'bound_box', None):
+                points.extend(obj.matrix_world @ mathutils.Vector(c) for c in obj.bound_box)
+            else:
+                points.append(obj.matrix_world.translation.copy())
+        if not points:
+            raise ValueError("No visible objects to frame")
+        low = mathutils.Vector(tuple(min(p[i] for p in points) for i in range(3)))
+        high = mathutils.Vector(tuple(max(p[i] for p in points) for i in range(3)))
+        center, extent = (low + high) * 0.5, max(high - low)
+        return self._look_at_point(center, max(0.1, extent * float(distance_multiplier))), center
+
+    def frame_object(self, object_name, distance_multiplier=2.0):
+        """Frame one named scene object in the active viewport."""
+        obj = bpy.data.objects.get(object_name)
+        if not obj:
+            raise ValueError(f"Object not found: {object_name}")
+        r3d, center = self._frame_objects([obj], distance_multiplier)
+        return {"success": True, "object": obj.name, "location": list(center), "distance": r3d.view_distance}
+
+    def frame_all(self, distance_multiplier=2.0):
+        """Frame all visible non-camera, non-light scene objects once."""
+        objects = [o for o in bpy.context.scene.objects if o.visible_get() and o.type not in {'CAMERA', 'LIGHT'}]
+        r3d, center = self._frame_objects(objects, distance_multiplier)
+        return {"success": True, "location": list(center), "distance": r3d.view_distance, "object_count": len(objects)}
+
+    def _empty(self, name):
+        obj = bpy.data.objects.get(name)
+        if not obj or obj.type != 'EMPTY':
+            raise ValueError(f"Empty not found: {name}")
+        return obj
+
+    def move_empty(self, name, location):
+        """Move one existing Empty to an explicit world-space location."""
+        obj = self._empty(name)
+        obj.location = self._vector(location, "location")
+        return {"success": True, "empty_name": obj.name, "location": list(obj.location)}
+
+    def rotate_empty(self, name, rotation):
+        """Set one existing Empty's Euler rotation in radians."""
+        obj = self._empty(name)
+        obj.rotation_euler = self._vector(rotation, "rotation")
+        return {"success": True, "empty_name": obj.name, "rotation": list(obj.rotation_euler)}
+
+    def delete_empty(self, name):
+        """Delete one named Empty and return immediately."""
+        obj = self._empty(name)
+        bpy.data.objects.remove(obj, do_unlink=True)
+        return {"success": True, "deleted": name}
+
+    def rename_empty(self, old_name, new_name):
+        """Rename one Empty without changing its transform."""
+        obj = self._empty(old_name)
+        if not isinstance(new_name, str) or not new_name.strip():
+            raise ValueError("new_name must be a non-empty string")
+        if bpy.data.objects.get(new_name) and bpy.data.objects.get(new_name) != obj:
+            raise ValueError(f"Object already exists: {new_name}")
+        obj.name = new_name.strip()
+        return {"success": True, "old_name": old_name, "new_name": obj.name}
 
     def execute_code(self, code):
         """Execute arbitrary Blender Python code"""
